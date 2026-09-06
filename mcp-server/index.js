@@ -42,20 +42,20 @@ async function resolveCompany(client, identifier) {
   if (identifier) {
     const trimmed = String(identifier).trim();
     if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(trimmed)) {
-      const res = await client.query('SELECT id, nombre, nit FROM public.companies WHERE id = $1 LIMIT 1;', [trimmed]);
+      const res = await client.query('SELECT id, nombre, nit, "dteProjectRef", "dteDatabaseName" FROM public.companies WHERE id = $1::uuid LIMIT 1;', [trimmed]);
       if (res.rows[0]) return res.rows[0];
     }
     const res = await client.query(
-      'SELECT id, nombre, nit FROM public.companies WHERE nombre ILIKE $1 OR nit ILIKE $1 LIMIT 1;',
+      'SELECT id, nombre, nit, "dteProjectRef", "dteDatabaseName" FROM public.companies WHERE nombre ILIKE $1 OR nit ILIKE $1 LIMIT 1;',
       [`%${trimmed}%`]
     );
     if (res.rows[0]) return res.rows[0];
   }
   const withRecs = await client.query(`
-    SELECT c.id, c.nombre, c.nit, COUNT(r.id) as rec_count 
+    SELECT c.id, c.nombre, c.nit, c."dteProjectRef", c."dteDatabaseName", COUNT(r.id) as rec_count 
     FROM public.companies c 
-    LEFT JOIN public.receivables r ON r."companyId" = c.id 
-    GROUP BY c.id, c.nombre, c.nit 
+    LEFT JOIN public.receivables r ON r."companyId"::text = c.id::text 
+    GROUP BY c.id, c.nombre, c.nit, c."dteProjectRef", c."dteDatabaseName" 
     ORDER BY rec_count DESC, c.nombre ASC 
     LIMIT 1;
   `);
@@ -289,11 +289,164 @@ async function listInventory(companyId) {
   }
 }
 
+async function syncFromDte(companyId) {
+  const client = await getDbClient();
+  try {
+    const comp = await resolveCompany(client, companyId);
+    if (!comp) {
+      return { error: 'No se encontró empresa registrada para sincronizar.' };
+    }
+    const cid = comp.id;
+    const dteProjectRef = comp.dteProjectRef || 'hgyvcybrkgtxmyjpscng';
+    const token = process.env.SUPABASE_ACCESS_TOKEN || DTE_TOKENS[dteProjectRef] || '';
+
+    if (!token) {
+      return { error: 'No se encontró SUPABASE_ACCESS_TOKEN configurado para acceder a DTE Fácil.' };
+    }
+
+    const sql = `
+      SELECT id, codigo_generacion, numero_control, dte_type, fecha_emision, monto_total, nombre_cliente, full_dte, estado
+      FROM historial_dtes
+      WHERE estado IN ('RECIBIDO', 'Transmitido') AND dte_type IN ('01', '03', 'Factura', 'Crédito Fiscal')
+      ORDER BY fecha_emision ASC;
+    `;
+
+    const response = await fetch(`https://api.supabase.com/v1/projects/${dteProjectRef}/database/query`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${token}`,
+        'Content-Type': 'application/json',
+        'User-Agent': 'Mozilla/5.0',
+      },
+      body: JSON.stringify({ query: sql }),
+    });
+
+    if (!response.ok) {
+      const errText = await response.text();
+      return { error: `Error al conectar a DTE Fácil SV (HTTP ${response.status}): ${errText}` };
+    }
+
+    const dtes = await response.json();
+    let nuevos = 0;
+    let actualizados = 0;
+    let itemsProcesados = 0;
+    const nuevosDocumentos = [];
+
+    for (const dte of dtes) {
+      const numeroControl = dte.numero_control;
+      const montoTotal = parseFloat(dte.monto_total || '0');
+      const fechaEmision = dte.fecha_emision ? new Date(dte.fecha_emision).toISOString().split('T')[0] : new Date().toISOString().split('T')[0];
+
+      const fullDte = dte.full_dte || {};
+      const receptor = fullDte.receptor || {};
+      const clienteNombre = (dte.nombre_cliente || receptor.nombre || 'Cliente General').trim();
+
+      // Excluir William Ordoñez por instrucción expresa
+      if (clienteNombre.toUpperCase().includes('WILLIAM ALEXANDER ORDO') || clienteNombre.toUpperCase().includes('WILLIAM ORDO')) {
+        continue;
+      }
+
+      const emisionDate = new Date(fechaEmision);
+      const vencimientoDate = new Date(emisionDate.getTime() + 30 * 24 * 60 * 60 * 1000);
+      const fechaVencimiento = vencimientoDate.toISOString().split('T')[0];
+
+      const checkRes = await client.query(
+        'SELECT id FROM public.receivables WHERE "companyId"::text = $1 AND "numeroControl" = $2 LIMIT 1;',
+        [String(cid), numeroControl]
+      );
+
+      const cuerpo = fullDte.cuerpoDocumento || [];
+      const resumen = fullDte.resumen || {};
+      const clienteNit = receptor.nit || receptor.numDocumento || null;
+      const clienteNrc = receptor.nrc || null;
+      const condicionOperacion = String(resumen.condicionOperacion || '1');
+
+      if (checkRes.rows.length === 0) {
+        await client.query(`
+          INSERT INTO public.receivables (
+            id, "companyId", "codigoGeneracion", "numeroControl", "tipoDte",
+            "fechaEmision", "fechaVencimiento", "clienteNombre", "clienteNit", "clienteNrc",
+            "montoTotal", "saldoPendiente", estado, "diasCredito", "condicionOperacion", items,
+            "createdAt", "updatedAt"
+          ) VALUES (
+            gen_random_uuid(), $1, $2, $3, $4,
+            $5, $6, $7, $8, $9,
+            $10, $11, 'PENDIENTE', 30, $12, $13,
+            CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+          );
+        `, [
+          String(cid), dte.codigo_generacion, numeroControl, dte.dte_type,
+          fechaEmision, fechaVencimiento, clienteNombre, clienteNit, clienteNrc,
+          montoTotal, montoTotal, condicionOperacion, JSON.stringify(cuerpo)
+        ]);
+
+        nuevos++;
+        nuevosDocumentos.push({
+          numeroControl,
+          cliente: clienteNombre,
+          monto: montoTotal,
+          fecha: fechaEmision
+        });
+      } else {
+        actualizados++;
+      }
+
+      // Procesar catálogo de productos
+      if (Array.isArray(cuerpo)) {
+        for (const it of cuerpo) {
+          const sku = (it.codigo || it.sku || '').trim();
+          const nombre = (it.descripcion || it.nombre || '').trim();
+          const precioVenta = parseFloat(it.precioUni || it.precioUnitario || '0');
+
+          if (sku && nombre) {
+            itemsProcesados++;
+            const prodRes = await client.query('SELECT id FROM public.products WHERE "companyId"::text = $1 AND codigo = $2 LIMIT 1;', [String(cid), sku]);
+            if (prodRes.rows.length > 0) {
+              await client.query('UPDATE public.products SET "precioVenta" = $1 WHERE id = $2;', [precioVenta, prodRes.rows[0].id]);
+            } else {
+              await client.query(`
+                INSERT INTO public.products (id, "companyId", codigo, nombre, "unidadMedida", "precioVenta", "stockActual", "costoPromedio", "createdAt")
+                VALUES (gen_random_uuid(), $1::uuid, $2, $3, 'UNIDAD', $4, 0, 0, CURRENT_TIMESTAMP);
+              `, [String(cid), sku, nombre, precioVenta]);
+            }
+          }
+        }
+      }
+    }
+
+    return {
+      success: true,
+      empresa: comp.nombre,
+      totalDtesEnDteFacil: dtes.length,
+      nuevosDtesSincronizados: nuevos,
+      dtesPreviamenteExistentes: actualizados,
+      totalCuentasPorCobrar: actualizados + nuevos,
+      itemsProcesados,
+      ultimosNuevos: nuevosDocumentos.slice(-5),
+      mensaje: nuevos > 0
+        ? `Se descargaron y sincronizaron ${nuevos} nuevas facturas/DTEs exitosamente desde DTE Fácil SV.`
+        : `Todas las facturas ya están al día en el sistema (${actualizados} DTEs registrados). No hay nuevos documentos pendientes.`
+    };
+  } finally {
+    await client.end();
+  }
+}
+
 // ==========================================
 // MODO SERVIDOR MCP (JSON-RPC 2.0 por Stdio)
 // ==========================================
 
 const MCP_TOOLS = [
+  {
+    name: 'econtab_sync_dte',
+    description: 'Sincroniza y descarga las nuevas ventas y facturas electrónicas (DTEs) desde el sistema de facturación DTE Fácil SV hacia eContabilidad, actualizando cuentas por cobrar e inventario.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        companyId: { type: 'string', description: 'ID o nombre de la empresa (opcional, por defecto toma la empresa activa)' }
+      }
+    }
+  },
   {
     name: 'econtab_list_companies',
     description: 'Lista todas las empresas o contribuyentes registrados en el sistema contable con sus fuentes DTE.',
@@ -400,6 +553,8 @@ function runMcpServer() {
 
         if (name === 'econtab_list_companies') {
           data = await listCompanies();
+        } else if (name === 'econtab_sync_dte') {
+          data = await syncFromDte(args.companyId);
         } else if (name === 'econtab_cxc_summary') {
           data = await getCxcSummary(args.companyId);
         } else if (name === 'econtab_cxc_list') {
@@ -494,9 +649,14 @@ async function runCli() {
       Precio_Venta: `$${parseFloat(p.precioVenta).toFixed(2)}`,
       Stock: parseFloat(p.stockActual)
     })));
+  } else if (cmd === 'sync') {
+    const companyId = args[1];
+    const res = await syncFromDte(companyId);
+    console.log(JSON.stringify(res, null, 2));
   } else {
     console.log('Comandos disponibles:');
     console.log('  node index.js companies               Lista las empresas registradas');
+    console.log('  node index.js sync [id]               Sincroniza ventas y DTEs desde DTE Fácil SV');
     console.log('  node index.js cxc:summary [id]        Resumen de cartera y morosidad');
     console.log('  node index.js cxc:list [PENDIENTE]    Lista de facturas por cobrar');
     console.log('  node index.js inventory               Lista productos y existencias');

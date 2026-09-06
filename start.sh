@@ -40,6 +40,7 @@ mcp_servers:
       - --mcp
     env:
       DATABASE_URL: "${DATABASE_URL}"
+      SUPABASE_ACCESS_TOKEN: "${SUPABASE_ACCESS_TOKEN}"
     enabled: true
 EOF
 
