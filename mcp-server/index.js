@@ -11,8 +11,8 @@ const readline = require('readline');
 const DB_URL = process.env.DATABASE_URL || 'postgresql://postgres.fntligjzcgsqzjqrdabh:EContabilidad2026PassDb@aws-1-us-west-2.pooler.supabase.com:6543/postgres';
 
 const DTE_TOKENS = {
-  'hgyvcybrkgtxmyjpscng': 'sbp_78b762d07ab279c5920c27dc2632c4d1f8b8b69a', // IMPORTADORA BENITEZ
-  'lezxtykjiiqkoyvdfzqa': 'sbp_164e96b589898be84dfa4e410ff0460fca47debd', // ECO TRANSPORTES
+  'hgyvcybrkgtxmyjpscng': process.env.SUPABASE_ACCESS_TOKEN || '', // IMPORTADORA BENITEZ
+  'lezxtykjiiqkoyvdfzqa': process.env.ECO_SUPABASE_ACCESS_TOKEN || '', // ECO TRANSPORTES
 };
 
 async function getDbClient() {
